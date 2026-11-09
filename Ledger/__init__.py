@@ -3,7 +3,7 @@ from sqlalchemy.sql import text
 import os
 import logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.WARNING,
     format=f'%(asctime)s.%(msecs)03d - {os.getpid()} - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
 )
@@ -29,8 +29,7 @@ class Ledger:
             sql = text('SELECT account_id FROM accounts;')
             logging.debug(sql)
             results = self.connection.execute(sql)
-            account_ids = [row[0] for row in results.all()]
-        return account_ids
+            return [row[0] for row in results.all()]
 
     def create_account(self, name):
         '''
@@ -85,35 +84,43 @@ class Ledger:
         2. This code uses f-strings instead of bind parameters.
             This can result in SQL injection vulnerabilities.
         '''
-        with self.connection.begin():
-            # lock the balances table so concurrent transfers can't cause lost updates
-            sql = text('LOCK TABLE balances IN ACCESS EXCLUSIVE MODE;')
-            logging.debug(sql)
-            self.connection.execute(sql)
-        
-            # insert the transaction
-            sql = text(f'INSERT INTO transactions (debit_account_id, credit_account_id, amount) VALUES ({debit_account_id}, {credit_account_id}, {amount});')
-            logging.debug(sql)
-            self.connection.execute(sql)
+        while True:
+            try:
+                with self.connection.begin():
+                    # lock the balances table so concurrent transfers can't cause lost updates
+                    # sql = text('LOCK TABLE balances IN ACCESS EXCLUSIVE MODE;')
+                    # logging.debug(sql)
+                    # self.connection.execute(sql)
 
-            # update the debit account balance
-            sql = text(f'SELECT balance FROM balances WHERE account_id = {debit_account_id};')
-            logging.debug(sql)
-            results = self.connection.execute(sql)
-            debit_account_balance = results.first()[0]
+                    # insert the transaction
+                    sql = text(f'INSERT INTO transactions (debit_account_id, credit_account_id, amount) VALUES ({debit_account_id}, {credit_account_id}, {amount});')
+                    logging.debug(sql)
+                    self.connection.execute(sql)
 
-            debit_new_balance = debit_account_balance - amount
-            sql = text(f'UPDATE balances SET balance={debit_new_balance} WHERE account_id = {debit_account_id};')
-            logging.debug(sql)
-            self.connection.execute(sql)
+                    # update the debit account balance
+                    sql = text(f'SELECT balance FROM balances WHERE account_id = {debit_account_id} FOR UPDATE;')
+                    logging.debug(sql)
+                    results = self.connection.execute(sql)
+                    debit_account_balance = results.first()[0]
 
-            # update the credit account balance
-            sql = text(f'SELECT balance FROM balances WHERE account_id = {credit_account_id};')
-            logging.debug(sql)
-            results = self.connection.execute(sql)
-            credit_account_balance = results.first()[0]
+                    debit_new_balance = debit_account_balance - amount
+                    sql = text(f'UPDATE balances SET balance={debit_new_balance} WHERE account_id = {debit_account_id};')
+                    logging.debug(sql)
+                    self.connection.execute(sql)
 
-            credit_new_balance = credit_account_balance + amount
-            sql = text(f'UPDATE balances SET balance={credit_new_balance} WHERE account_id = {credit_account_id};')
-            logging.debug(sql)
-            self.connection.execute(sql)
+                    # update the credit account balance
+                    sql = text(f'SELECT balance FROM balances WHERE account_id = {credit_account_id} FOR UPDATE;')
+                    logging.debug(sql)
+                    results = self.connection.execute(sql)
+                    credit_account_balance = results.first()[0]
+
+                    credit_new_balance = credit_account_balance + amount
+                    sql = text(f'UPDATE balances SET balance={credit_new_balance} WHERE account_id = {credit_account_id};')
+                    logging.debug(sql)
+                    self.connection.execute(sql)
+
+                break
+            except sqlalchemy.exc.OperationalError as e:
+                if 'deadlock detected' not in str(e):
+                    raise
+                logging.debug('deadlock detected, retrying')
